@@ -2,14 +2,7 @@ import boto3
 import cloudpassage
 import os
 from collections import defaultdict
-
-
-def get_aws_cves(cve_arn):
-    client = boto3.client('inspector')
-    finding_arns = client.list_findings(maxResults=20, filter={'rulesPackageArns': [cve_arn]})['findingArns']
-    cve_findings = client.describe_findings(findingArns=finding_arns)['findings']
-
-    return cve_findings
+from datetime import datetime
 
 
 def format_cve_findings(findings):
@@ -17,11 +10,9 @@ def format_cve_findings(findings):
     for finding in findings:
         csp_instance_id = finding['assetAttributes']['agentId']
         first_seen_at = finding['createdAt']
-        last_seen_at = finding['updatedAt']
+        last_seen_at = finding['createdAt']
         cve_id = finding['id']
 
-        cvss2_score = None
-        cvss3_score = None
         for attribute in finding['attributes']:
             if attribute['key'] == 'CVSS3_SCORE':
                 cvss3_score = attribute['value']
@@ -40,11 +31,12 @@ def format_cve_findings(findings):
             if attribute['key'] == 'package_name':
                 for package in attribute['value'].split(','):
                     colon_index = package.index(':')
-                    package_name = package[:colon_index-2]
-                    package_version = package[colon_index-1:]
+                    package_name = package[:colon_index - 2]
+                    package_version = package[colon_index - 1:]
 
                     try:
-                        package_to_cves[package_name]['cve_info'].append(cve_info)
+                        if cve_info not in package_to_cves[package_name]['cve_info']:
+                            package_to_cves[package_name]['cve_info'].append(cve_info)
                         if first_seen_at < package_to_cves[package_name]['first_seen_at']:
                             package_to_cves[package_name]['first_seen_at'] = first_seen_at
                         if last_seen_at > package_to_cves[package_name]['last_seen_at']:
@@ -61,8 +53,9 @@ def format_cve_findings(findings):
     return instance_to_packages
 
 
-def create_new_halo_issue(package_detail, target, session, issue_type):
+def create_new_sva_issue(package_detail, target, session, issue_type):
     request = cloudpassage.HttpHelper(session)
+
     # Find Max CVSS Score
     max_cvss = max(cve_info['score'] for cve_info in package_detail['cve_info'])
 
@@ -73,7 +66,7 @@ def create_new_halo_issue(package_detail, target, session, issue_type):
 
     issue = {
         'rule_key': f'aws_inspector::::{issue_type}::::'
-                    f'{package_detail["package_name"]+package_detail["package_version"]}',
+                    f'{package_detail["package_name"] + package_detail["package_version"]}',
         'name': f'AWS Inspector-Vulnerable software: {package_detail["package_name"]}',
         'type': issue_type,
         'status': 'active',
@@ -90,13 +83,43 @@ def create_new_halo_issue(package_detail, target, session, issue_type):
             'cve_info': package_detail['cve_info']
         },
         'external_issue': True,
-        'external_issue_source': 'aws_inspector'
+        'external_issue_source': 'aws_inspector',
+        'first_seen_at': package_detail['first_seen_at'].isoformat(),
+        'last_seen_at': package_detail['last_seen_at'].isoformat(),
+        'csp_account_id': target['csp_account_id'],
+        'csp_account_type': target['csp_provider'].split('_')[0],
+        'csp_region': target['csp_region'],
+        'csp_resource_id': target['csp_instance_id'],
+        'csp_image_id': target['csp_image_id'],
+        'os_type': target['kernel_name'].lower()
     }
 
     request.post('/v3/issues', {'issue': issue})
 
 
-def push_issues_halo(findings, issue_type):
+def update_sva_issue(package_detail, halo_issue, target, session):
+    cve_set = set(cve['id'] for cve in halo_issue['extended_attributes']['cve_info'])
+
+    for cve in package_detail['cve_info']:
+        if cve['id'] not in cve_set:
+            halo_issue['extended_attributes']['cve_info'].append(cve)
+
+    new_max_cvss = max(cve_info['score'] for cve_info in halo_issue['extended_attributes']['cve_info'])
+    halo_issue['max_cvss'] = new_max_cvss
+    if new_max_cvss >= 5:
+        halo_issue['critical'] = True
+
+    # Full isoformat has length 27. Need to pad last_seen_at with trailing zeros for correct isoformat
+    trailing_zeros = 27 - len(halo_issue['last_seen_at'])
+    halo_last_seen_dt = datetime.fromisoformat(halo_issue['last_seen_at'][:-1] + trailing_zeros*'0')
+    if halo_last_seen_dt < package_detail['last_seen_at'].replace(tzinfo=None):
+        halo_issue['last_seen_at'] = package_detail['last_seen_at'].isoformat()
+
+    request = cloudpassage.HttpHelper(session)
+    request.post('/v3/issues', {'issue': halo_issue})
+
+
+def push_cves_issues_halo(findings, issue_type):
     session = cloudpassage.HaloSession(os.environ['HALO_API_KEY'],
                                        os.environ['HALO_API_SECRET'],
                                        api_host=os.getenv('HALO_API_HOST', 'api.cloudpassage.com'),
@@ -114,15 +137,14 @@ def push_issues_halo(findings, issue_type):
                 halo_issue = issue.list_all(
                     type=issue_type,
                     asset_id=asset_id,
-                    rule_key=f'aws_inspector::::{issue_type}::::{package_name+package_detail["package_version"]}',
+                    rule_key=f'aws_inspector::::{issue_type}::::{package_name + package_detail["package_version"]}',
                     status='active,resolved'
                 )
                 # if vulnerable package exists in target_openvas_issues, update issue
                 if halo_issue:
-                    pass
-                    # update_halo_issue(package_detail, halo_issue[0], target, session)
+                    update_sva_issue(package_detail, halo_issue[0], target, session)
                 else:
-                    create_new_halo_issue(package_detail, target, session, issue_type)
+                    create_new_sva_issue(package_detail, target, session, issue_type)
 
 
 def get_rule_arns():
@@ -148,19 +170,95 @@ def get_rule_arns():
 
     return rule_arns
 
+
+def create_new_csm_issue(cis_finding, target, session):
+    request = cloudpassage.HttpHelper(session)
+
+    critical = True if cis_finding['severity'] == 'High' else False
+    for attribute in cis_finding['attributes']:
+        if attribute['key'] == "BENCHMARK_ID":
+            benchmark_id = attribute['value']
+
+    issue = {
+        'rule_key': f'aws_inspector::::csm::::{cis_finding["id"]}',
+        'name': f'AWS Inspector: {cis_finding["id"].split(" ", 1)[1]}',
+        'type': 'csm',
+        'status': 'active',
+        'critical': critical,
+        'source': 'server_secure',
+        'asset_id': target['id'],
+        'asset_type': 'server',
+        'asset_name': target['hostname'],
+        'asset_fqdn': target.get('reported_fqdn'),
+        'asset_hostname': target['hostname'],
+        'external_issue': True,
+        'external_issue_source': 'aws_inspector',
+        'rule_name': cis_finding["id"].split(" ", 1)[1],
+        'policy_name': benchmark_id,
+        'first_seen_at': cis_finding['createdAt'].isoformat(),
+        'last_seen_at': cis_finding['createdAt'].isoformat(),
+        'extended_attributes': {
+            'recommendation': cis_finding['recommendation'],
+            'numeric_severity': cis_finding['numericSeverity']
+        },
+        'csp_account_id': target['csp_account_id'],
+        'csp_account_type': target['csp_provider'].split('_')[0],
+        'csp_region': target['csp_region'],
+        'csp_resource_id': target['csp_instance_id'],
+        'csp_image_id': target['csp_image_id'],
+        'os_type': target['kernel_name'].lower()
+    }
+
+    request.post('/v3/issues', {'issue': issue})
+
+
+def push_cis_issues_halo(cis_findings):
+    session = cloudpassage.HaloSession(os.environ['HALO_API_KEY'],
+                                       os.environ['HALO_API_SECRET'],
+                                       api_host=os.getenv('HALO_API_HOST', 'api.cloudpassage.com'),
+                                       api_port=os.getenv('HALO_CONNECTION_PORT', '443'))
+    server = cloudpassage.Server(session)
+    issue = cloudpassage.Issue(session, endpoint_version=3)
+
+    for cis_finding in cis_findings:
+        instance_id = cis_finding['assetAttributes']['agentId']
+        target_halo_asset = server.list_all(csp_instance_id=instance_id)
+        if target_halo_asset:
+            target = target_halo_asset[0]
+            create_new_csm_issue(cis_finding, target, session)
+
+
+def ingest_cves(cve_arn):
+    client = boto3.client('inspector')
+    paginator = client.get_paginator('list_findings')
+    page_iterator = paginator.paginate(filter={'rulesPackageArns': [cve_arn]}, PaginationConfig={'PageSize': 1000,})
+    for page in page_iterator:
+        finding_arns = page['findingArns']
+        cve_findings = client.describe_findings(findingArns=finding_arns)['findings']
+        cve_findings_formatted = format_cve_findings(cve_findings)
+        push_cves_issues_halo(cve_findings_formatted, 'sva')
+
+
+def ingest_cis(cis_arn):
+    client = boto3.client('inspector')
+    paginator = client.get_paginator('list_findings')
+    page_iterator = paginator.paginate(filter={'rulesPackageArns': [cis_arn]}, PaginationConfig={'PageSize': 1000,})
+    for page in page_iterator:
+        finding_arns = page['findingArns']
+        cis_findings = client.describe_findings(findingArns=finding_arns)['findings']
+        push_cis_issues_halo(cis_findings)
+
 def main():
     rule_arns = get_rule_arns()
 
     #  Software Vulnerabilities (CVEs)
     if 'cve' in rule_arns:
-        cve_findings = get_aws_cves(rule_arns['cve'])
-        cve_findings_formatted = format_cve_findings(cve_findings)
-        push_issues_halo(cve_findings_formatted, 'sva')
+        ingest_cves(rule_arns['cve'])
+
 
     #  CIS Benchmarks
     if 'cis' in rule_arns:
-        pass
-
+        ingest_cis(rule_arns['cis'])
 
 
 if __name__ == "__main__":
