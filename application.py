@@ -140,7 +140,7 @@ def push_cves_issues_halo(findings, issue_type):
                     rule_key=f'aws_inspector::::{issue_type}::::{package_name + package_detail["package_version"]}',
                     status='active,resolved'
                 )
-                # if vulnerable package exists in target_openvas_issues, update issue
+                # if vulnerable package exists in Halo, update issue
                 if halo_issue:
                     update_sva_issue(package_detail, halo_issue[0], target, session)
                 else:
@@ -160,28 +160,51 @@ def get_rule_arns():
     rule_arns = {}
     for rule_package in rule_arn_details['rulesPackages']:
         if rule_package['name'] == 'Common Vulnerabilities and Exposures':
-            rule_arns['cve'] = rule_package['arn']
+            rule_arns['cve'] = {'arn': rule_package['arn'], 'name': f"{rule_package['name']}-{rule_package['version']}"}
         if rule_package['name'] == 'CIS Operating System Security Configuration Benchmarks':
-            rule_arns['cis'] = rule_package['arn']
+            rule_arns['cis'] = {'arn': rule_package['arn'], 'name': f"{rule_package['name']}-{rule_package['version']}"}
         if rule_package['name'] == 'Security Best Practices':
-            rule_arns['sbp'] = rule_package['arn']
+            rule_arns['sbp'] = {'arn': rule_package['arn'], 'name': f"{rule_package['name']}-{rule_package['version']}"}
         if rule_package['name'] == 'Network Reachability':
-            rule_arns['net'] = rule_package['arn']
+            rule_arns['net'] = {'arn': rule_package['arn'], 'name': f"{rule_package['name']}-{rule_package['version']}"}
 
     return rule_arns
 
 
-def create_new_csm_issue(cis_finding, target, session):
+def update_issue_sbp(issue, finding, policy_name):
+    sbp_values = {
+        'name': finding['title'],
+        'rule_name': finding['id'],
+        'policy_name': policy_name
+    }
+    issue.update(sbp_values)
+
+    return issue
+
+
+def update_issue_net(issue, finding, policy_name):
+    net_values = {
+        'name': finding['title'],
+        'rule_name': finding['id'],
+        'policy_name': policy_name
+    }
+    issue.update(net_values)
+
+    return issue
+
+
+def create_new_csm_issue(finding, target, session, arn_dict):
     request = cloudpassage.HttpHelper(session)
 
-    critical = True if cis_finding['severity'] == 'High' else False
-    for attribute in cis_finding['attributes']:
+    benchmark_id = None
+    critical = True if finding['severity'] == 'High' else False
+    for attribute in finding['attributes']:
         if attribute['key'] == "BENCHMARK_ID":
             benchmark_id = attribute['value']
 
     issue = {
-        'rule_key': f'aws_inspector::::csm::::{cis_finding["id"]}',
-        'name': f'AWS Inspector: {cis_finding["id"].split(" ", 1)[1]}',
+        'rule_key': f'aws_inspector::::csm::::{finding["id"]}',
+        'name': f'AWS Inspector: {finding["id"].split(" ", 1)[1]}',
         'type': 'csm',
         'status': 'active',
         'critical': critical,
@@ -193,13 +216,14 @@ def create_new_csm_issue(cis_finding, target, session):
         'asset_hostname': target['hostname'],
         'external_issue': True,
         'external_issue_source': 'aws_inspector',
-        'rule_name': cis_finding["id"].split(" ", 1)[1],
+        'rule_name': finding["id"].split(" ", 1)[1],
         'policy_name': benchmark_id,
-        'first_seen_at': cis_finding['createdAt'].isoformat(),
-        'last_seen_at': cis_finding['createdAt'].isoformat(),
+        'first_seen_at': finding['createdAt'].isoformat(),
+        'last_seen_at': finding['createdAt'].isoformat(),
         'extended_attributes': {
-            'recommendation': cis_finding['recommendation'],
-            'numeric_severity': cis_finding['numericSeverity']
+            'recommendation': finding['recommendation'],
+            'numeric_severity': finding['numericSeverity'],
+            'description': finding['description']
         },
         'csp_account_id': target['csp_account_id'],
         'csp_account_type': target['csp_provider'].split('_')[0],
@@ -209,10 +233,15 @@ def create_new_csm_issue(cis_finding, target, session):
         'os_type': target['kernel_name'].lower()
     }
 
+    if 'Security Best Practices' in arn_dict['name']:
+        issue = update_issue_sbp(issue, finding, arn_dict['name'])
+    if 'Network Reachability' in arn_dict['name']:
+        issue = update_issue_net(issue, finding, arn_dict['name'])
+
     request.post('/v3/issues', {'issue': issue})
 
 
-def push_cis_issues_halo(cis_findings):
+def push_cis_issues_halo(arn_dict, cis_findings):
     session = cloudpassage.HaloSession(os.environ['HALO_API_KEY'],
                                        os.environ['HALO_API_SECRET'],
                                        api_host=os.getenv('HALO_API_HOST', 'api.cloudpassage.com'),
@@ -225,40 +254,41 @@ def push_cis_issues_halo(cis_findings):
         target_halo_asset = server.list_all(csp_instance_id=instance_id)
         if target_halo_asset:
             target = target_halo_asset[0]
-            create_new_csm_issue(cis_finding, target, session)
+            create_new_csm_issue(cis_finding, target, session, arn_dict)
 
 
-def ingest_cves(cve_arn):
+def ingest_cves(arn_dict):
     client = boto3.client('inspector')
     paginator = client.get_paginator('list_findings')
-    page_iterator = paginator.paginate(filter={'rulesPackageArns': [cve_arn]}, PaginationConfig={'PageSize': 1000,})
+    page_iterator = paginator.paginate(filter={'rulesPackageArns': [arn_dict['arn']]}, PaginationConfig={'PageSize': 1000,})
     for page in page_iterator:
         finding_arns = page['findingArns']
-        cve_findings = client.describe_findings(findingArns=finding_arns)['findings']
-        cve_findings_formatted = format_cve_findings(cve_findings)
-        push_cves_issues_halo(cve_findings_formatted, 'sva')
+        if finding_arns:
+            cve_findings = client.describe_findings(findingArns=finding_arns)['findings']
+            cve_findings_formatted = format_cve_findings(cve_findings)
+            push_cves_issues_halo(cve_findings_formatted, 'sva')
 
 
-def ingest_cis(cis_arn):
+def ingest_cis(arn_dict):
     client = boto3.client('inspector')
     paginator = client.get_paginator('list_findings')
-    page_iterator = paginator.paginate(filter={'rulesPackageArns': [cis_arn]}, PaginationConfig={'PageSize': 1000,})
+    page_iterator = paginator.paginate(filter={'rulesPackageArns': [arn_dict['arn']]}, PaginationConfig={'PageSize': 1000,})
     for page in page_iterator:
         finding_arns = page['findingArns']
-        cis_findings = client.describe_findings(findingArns=finding_arns)['findings']
-        push_cis_issues_halo(cis_findings)
+        if finding_arns:
+            cis_findings = client.describe_findings(findingArns=finding_arns)['findings']
+            push_cis_issues_halo(arn_dict, cis_findings)
 
 def main():
     rule_arns = get_rule_arns()
 
-    #  Software Vulnerabilities (CVEs)
-    if 'cve' in rule_arns:
-        ingest_cves(rule_arns['cve'])
-
-
-    #  CIS Benchmarks
-    if 'cis' in rule_arns:
-        ingest_cis(rule_arns['cis'])
+    for rule, arn_dict in rule_arns.items():
+        #  Software Vulnerabilities (CVEs)
+        if rule == 'cve':
+            ingest_cves(arn_dict)
+        #  CIS Benchmarks, Network, Security Best Practices
+        else:
+            ingest_cis(arn_dict)
 
 
 if __name__ == "__main__":
