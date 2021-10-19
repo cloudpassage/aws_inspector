@@ -13,6 +13,7 @@ def format_cve_findings(findings):
         last_seen_at = finding['createdAt']
         cve_id = finding['id']
 
+        cvss2_score, cvss3_score = None, None
         for attribute in finding['attributes']:
             if attribute['key'] == 'CVSS3_SCORE':
                 cvss3_score = attribute['value']
@@ -20,11 +21,15 @@ def format_cve_findings(findings):
             elif attribute['key'] == 'CVSS2_SCORE':
                 cvss2_score = attribute['value']
 
-        cve_info = {
-            'id': cve_id,
-            'score': float(cvss3_score or cvss2_score),
-            'cvss_version': 3 if cvss3_score else 2
-        }
+        # If CVSS Scores unavailable skip to next finding
+        try:
+            cve_info = {
+                'id': cve_id,
+                'score': float(cvss3_score or cvss2_score),
+                'cvss_version': 3 if cvss3_score else 2
+            }
+        except TypeError:
+            continue
 
         package_to_cves = instance_to_packages[csp_instance_id]
         for attribute in finding['attributes']:
@@ -278,10 +283,19 @@ def push_cis_issues_halo(arn_dict, cis_findings):
                 create_new_csm_issue(cis_finding, target, session, arn_dict)
 
 
-def ingest_cves(arn_dict):
+def ingest_cves(arn_dict, timestamp_dt):
     client = boto3.client('inspector')
     paginator = client.get_paginator('list_findings')
-    page_iterator = paginator.paginate(filter={'rulesPackageArns': [arn_dict['arn']]}, PaginationConfig={'PageSize': 1000,})
+    page_iterator = paginator.paginate(
+        filter={
+            'rulesPackageArns': [arn_dict['arn']],
+            'creationTimeRange': {
+                'beginDate': timestamp_dt,
+                'endDate': datetime.max
+            }
+        },
+        PaginationConfig={'PageSize': 1000,}
+    )
     for page in page_iterator:
         finding_arns = page['findingArns']
         if finding_arns:
@@ -290,26 +304,58 @@ def ingest_cves(arn_dict):
             push_cves_issues_halo(cve_findings_formatted, 'sva')
 
 
-def ingest_cis(arn_dict):
+def ingest_cis(arn_dict, timestamp_dt):
     client = boto3.client('inspector')
     paginator = client.get_paginator('list_findings')
-    page_iterator = paginator.paginate(filter={'rulesPackageArns': [arn_dict['arn']]}, PaginationConfig={'PageSize': 1000,})
+    page_iterator = paginator.paginate(
+        filter={
+            'rulesPackageArns': [arn_dict['arn']],
+            'creationTimeRange': {
+                'beginDate': timestamp_dt,
+                'endDate': datetime.max
+            }
+        },
+        PaginationConfig={'PageSize': 1000,}
+    )
     for page in page_iterator:
         finding_arns = page['findingArns']
         if finding_arns:
             cis_findings = client.describe_findings(findingArns=finding_arns)['findings']
             push_cis_issues_halo(arn_dict, cis_findings)
 
+
+def get_timestamp():
+    session = cloudpassage.HaloSession(os.environ['HALO_API_KEY'],
+                                       os.environ['HALO_API_SECRET'],
+                                       api_host=os.getenv('HALO_API_HOST', 'api.cloudpassage.com'),
+                                       api_port=os.getenv('HALO_CONNECTION_PORT', '443'))
+    issue = cloudpassage.Issue(session, endpoint_version=3)
+    timestamp_dt = datetime.min
+    time_sorted_issues = issue.list_all(
+        external_issue_source='aws_inspector',
+        status='active,resolved',
+        sort_by='last_seen_at.desc',
+        max_pages=1
+    )
+    if time_sorted_issues:
+        # Full isoformat has length 27. Need to pad last_seen_at with trailing zeros for correct isoformat
+        latest_issue = time_sorted_issues[0]
+        trailing_zeros = 27 - len(latest_issue['last_seen_at'])
+        timestamp_dt = datetime.fromisoformat(latest_issue['last_seen_at'][:-1] + trailing_zeros*'0')
+    return timestamp_dt
+
+
 def main():
+    timestamp_dt = get_timestamp()
     rule_arns = get_rule_arns()
 
     for rule, arn_dict in rule_arns.items():
         #  Software Vulnerabilities (CVEs)
         if rule == 'cve':
-            ingest_cves(arn_dict)
+            ingest_cves(arn_dict, timestamp_dt)
         #  CIS Benchmarks, Network, Security Best Practices
         else:
-            ingest_cis(arn_dict)
+            ingest_cis(arn_dict, timestamp_dt)
 
 
 if __name__ == "__main__":
