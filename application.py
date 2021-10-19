@@ -97,7 +97,7 @@ def create_new_sva_issue(package_detail, target, session, issue_type):
     request.post('/v3/issues', {'issue': issue})
 
 
-def update_sva_issue(package_detail, halo_issue, target, session):
+def update_sva_issue(package_detail, halo_issue, session):
     cve_set = set(cve['id'] for cve in halo_issue['extended_attributes']['cve_info'])
 
     for cve in package_detail['cve_info']:
@@ -142,7 +142,7 @@ def push_cves_issues_halo(findings, issue_type):
                 )
                 # if vulnerable package exists in Halo, update issue
                 if halo_issue:
-                    update_sva_issue(package_detail, halo_issue[0], target, session)
+                    update_sva_issue(package_detail, halo_issue[0], session)
                 else:
                     create_new_sva_issue(package_detail, target, session, issue_type)
 
@@ -241,6 +241,17 @@ def create_new_csm_issue(finding, target, session, arn_dict):
     request.post('/v3/issues', {'issue': issue})
 
 
+def update_csm_issue(finding, halo_issue, session):
+    # Full isoformat has length 27. Need to pad last_seen_at with trailing zeros for correct isoformat
+    trailing_zeros = 27 - len(halo_issue['last_seen_at'])
+    halo_last_seen_dt = datetime.fromisoformat(halo_issue['last_seen_at'][:-1] + trailing_zeros*'0')
+    if halo_last_seen_dt < finding['createdAt'].replace(tzinfo=None):
+        halo_issue['last_seen_at'] = finding['createdAt'].isoformat()
+
+    request = cloudpassage.HttpHelper(session)
+    request.post('/v3/issues', {'issue': halo_issue})
+
+
 def push_cis_issues_halo(arn_dict, cis_findings):
     session = cloudpassage.HaloSession(os.environ['HALO_API_KEY'],
                                        os.environ['HALO_API_SECRET'],
@@ -254,7 +265,17 @@ def push_cis_issues_halo(arn_dict, cis_findings):
         target_halo_asset = server.list_all(csp_instance_id=instance_id)
         if target_halo_asset:
             target = target_halo_asset[0]
-            create_new_csm_issue(cis_finding, target, session, arn_dict)
+            asset_id = target['id']
+            halo_issue = issue.list_all(
+                type='csm',
+                asset_id=asset_id,
+                rule_key=f'aws_inspector::::csm::::{cis_finding["id"]}',
+                status='active,resolved'
+            )
+            if halo_issue:
+                update_csm_issue(cis_finding, halo_issue[0], session)
+            else:
+                create_new_csm_issue(cis_finding, target, session, arn_dict)
 
 
 def ingest_cves(arn_dict):
